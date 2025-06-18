@@ -1,0 +1,54 @@
+# FinSight Multi-Agent Financial Research System Dependencies
+# Core AutoGen and AI framework dependencies
+pyautogen>=0.2.0
+openai>=1.0.0
+anthropic>=0.25.0
+
+# Data collection and financial APIs
+yfinance>=0.2.18
+sec-edgar-downloader>=5.0.0
+sec-api>=1.0.0  # For PDF generation of SEC filings
+finnhub-python>=2.4.18
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# ML and NLP capabilities
+transformers>=4.30.0
+torch>=2.0.0
+scikit-learn>=1.3.0
+
+# Data visualization and charting
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.15.0
+Pillow>=10.0.0
+
+# Report generation
+reportlab>=4.0.0
+
+# Vector database and storage
+chromadb>=0.4.0
+
+# Configuration and environment management
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+
+# Web scraping and parsing
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Async and utility libraries
+aiohttp>=3.8.0
+asyncio-throttle>=1.0.2
+
+# Development and testing tools
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+flake8>=6.0.0
+
+# Jupyter for testing and development
+jupyter>=1.0.0
+ipykernel>=6.25.0 
