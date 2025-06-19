@@ -18,6 +18,8 @@ import torch
 from pathlib import Path
 import zipfile
 from bs4 import BeautifulSoup
+import html
+import time
 
 
 from shared_memory.memory_manager import SharedMemoryManager
@@ -42,6 +44,7 @@ class DataCollectorTools:
     def __init__(self, config: FinSightConfig):
         self.config = config
         self.finnhub_client = finnhub.Client(api_key=config.finnhub_api_key) if config.finnhub_api_key else None
+        self.fmp_api_key = config.fmp_api_key
         # Note: edgar_downloader will be created per-company in get_sec_filings()
         # since each company needs its own download path
         # self.sec_filings_path = os.path.join(config.charts_output_path, "sec_filings")
@@ -193,26 +196,153 @@ class DataCollectorTools:
             return {"success": False, "error": str(e)}
     
     def get_esg_data(self, symbol: str) -> Dict[str, Any]:
-        """Get ESG data (placeholder - would integrate with actual ESG providers)"""
+        """Get ESG data from Financial Modeling Prep API with yfinance fallback"""
         try:
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            
             esg_data = {
                 "symbol": symbol,
-                "sustainability_score": None,
+                "esg_score": None,
                 "environment_score": None,
                 "social_score": None,
                 "governance_score": None,
-                "esg_risk_rating": None,
-                "controversies": [],
-                "carbon_footprint": None,
-                "employee_count": info.get("fullTimeEmployees"),
-                "board_diversity": None,
-                "executive_compensation": None
+                "esgrisk_rating": None,
+                "industry": None,
+                "industry_rank": None,
+                "fiscal_year": None,
+                "source": "financial_modeling_prep"
             }
             
-            return {"success": True, "data": esg_data, "note": "Placeholder ESG data - integrate with ESG providers"}
+            # Try FMP API first
+            if self.fmp_api_key:
+                try:
+                    # Get ESG Score data using ESG Investment Search API
+                    esg_score_url = f"https://financialmodelingprep.com/stable/esg-disclosures?symbol={symbol}&apikey={self.fmp_api_key}"
+                    response = requests.get(esg_score_url)
+                    
+                    if response.status_code == 200:
+                        esg_score_data = response.json()
+                        if esg_score_data and len(esg_score_data) > 0:
+                            latest_esg = esg_score_data[0]  # Get the most recent data
+                            esg_data.update({
+                                "esg_score": latest_esg.get("ESGScore"),
+                                "environment_score": latest_esg.get("environmentalScore"),
+                                "social_score": latest_esg.get("socialScore"),
+                                "governance_score": latest_esg.get("governanceScore"),
+                                "date": latest_esg.get("date"),
+                                "cik": latest_esg.get("cik"),
+                                "company_name": latest_esg.get("companyName")
+                            })
+                    else:
+                        logger.warning(f"ESG Score API returned status {response.status_code} for {symbol}")
+                        
+                except Exception as e:
+                    logger.warning(f"Error fetching ESG score data from FMP for {symbol}: {e}")
+                
+                try:
+                    # Get ESG Rating data using Ratings API
+                    esg_rating_url = f"https://financialmodelingprep.com/stable/esg-ratings?symbol={symbol}&apikey={self.fmp_api_key}"
+                    response = requests.get(esg_rating_url)
+                    
+                    if response.status_code == 200:
+                        esg_rating_data = response.json()
+                        if esg_rating_data and len(esg_rating_data) > 0:
+                            latest_rating = esg_rating_data[0]  # Get the most recent rating
+                            esg_data.update({
+                                "esgrisk_rating": latest_rating.get("ESGRiskRating"),
+                                "industry": latest_rating.get("industry"),
+                                "industry_rank": latest_rating.get("industryRank"),
+                                "fiscal_year": latest_rating.get("fiscalYear"),
+                            })
+                    else:
+                        logger.warning(f"ESG Rating API returned status {response.status_code} for {symbol}")
+                        
+                except Exception as e:
+                    logger.warning(f"Error fetching ESG rating data from FMP for {symbol}: {e}")
+            
+            # If FMP didn't provide complete ESG data, try yfinance as fallback
+            if not all([esg_data["esg_score"], esg_data["environment_score"], 
+                       esg_data["social_score"], esg_data["governance_score"]]):
+                logger.info(f"FMP ESG data incomplete or unavailable, trying yfinance for {symbol}...")
+                
+                try:
+                    # Get ESG data from yfinance using sustainability data
+                    ticker = yf.Ticker(symbol)
+                    sustainability_data = ticker.sustainability
+                    
+                    if sustainability_data is not None and not sustainability_data.empty:
+                        # yfinance sustainability data comes as a DataFrame
+                        # Convert to dict for easier access
+                        sustainability_dict = sustainability_data.to_dict()
+                        
+                        # Extract the first (and usually only) column of data
+                        if sustainability_dict:
+                            # Get the first column key (usually a date or similar)
+                            first_col = list(sustainability_dict.keys())[0]
+                            esg_metrics = sustainability_dict[first_col]
+                            
+                            # Map yfinance ESG fields to our structure
+                            if not esg_data["esg_score"]:
+                                # Use totalEsg if available
+                                esg_data["esg_score"] = esg_metrics.get("totalEsg")
+                            
+                            if not esg_data["environment_score"]:
+                                esg_data["environment_score"] = esg_metrics.get("environmentScore")
+                            
+                            if not esg_data["social_score"]:
+                                esg_data["social_score"] = esg_metrics.get("socialScore")
+                            
+                            if not esg_data["governance_score"]:
+                                esg_data["governance_score"] = esg_metrics.get("governanceScore")
+                            
+                            # Add yfinance-specific ESG data (core metrics only)
+                            yfinance_esg_data = {
+                                "peer_count": esg_metrics.get("peerCount"),
+                                "esg_performance": esg_metrics.get("esgPerformance"),
+                                "peer_group": esg_metrics.get("peerGroup"),
+                                "related_controversy": esg_metrics.get("relatedControversy"),
+                                "highest_controversy": esg_metrics.get("highestControversy"),
+                                "peer_esg_score_performance": {
+                                    "min": esg_metrics.get("peerEsgScorePerformance", {}).get("min"),
+                                    "avg": esg_metrics.get("peerEsgScorePerformance", {}).get("avg"),
+                                    "max": esg_metrics.get("peerEsgScorePerformance", {}).get("max")
+                                },
+                                "peer_governance_performance": {
+                                    "min": esg_metrics.get("peerGovernancePerformance", {}).get("min"),
+                                    "avg": esg_metrics.get("peerGovernancePerformance", {}).get("avg"),
+                                    "max": esg_metrics.get("peerGovernancePerformance", {}).get("max")
+                                },
+                                "peer_social_performance": {
+                                    "min": esg_metrics.get("peerSocialPerformance", {}).get("min"),
+                                    "avg": esg_metrics.get("peerSocialPerformance", {}).get("avg"),
+                                    "max": esg_metrics.get("peerSocialPerformance", {}).get("max")
+                                },
+                                "peer_environment_performance": {
+                                    "min": esg_metrics.get("peerEnvironmentPerformance", {}).get("min"),
+                                    "avg": esg_metrics.get("peerEnvironmentPerformance", {}).get("avg"),
+                                    "max": esg_metrics.get("peerEnvironmentPerformance", {}).get("max")
+                                },
+                                "percentile": esg_metrics.get("percentile"),
+                                "environment_percentile": esg_metrics.get("environmentPercentile"),
+                                "social_percentile": esg_metrics.get("socialPercentile"),
+                                "governance_percentile": esg_metrics.get("governancePercentile"),
+                                "data_provider": "Yahoo Finance/Sustainalytics"
+                            }
+                            
+                            # Remove None values from yfinance_esg_data
+                            yfinance_esg_data = {k: v for k, v in yfinance_esg_data.items() if v is not None}
+                            
+                            esg_data.update({
+                                "source": "yfinance_fallback" if esg_data["source"] == "financial_modeling_prep" else "hybrid",
+                                "yfinance_esg_data": yfinance_esg_data
+                            })
+                        
+                        logger.info(f"Successfully retrieved ESG data from yfinance for {symbol}")
+                    else:
+                        logger.warning(f"No ESG sustainability data found in yfinance for {symbol}")
+                        
+                except Exception as e:
+                    logger.warning(f"Error fetching ESG data from yfinance for {symbol}: {e}")
+
+            return {"success": True, "data": esg_data}
             
         except Exception as e:
             logger.error(f"Error getting ESG data for {symbol}: {e}")
@@ -716,71 +846,260 @@ class DataCollectorTools:
             logger.error(f"Error parsing SEC filing {filing_path}: {e}")
             return None
     
+    def _get_transcript_filepath(self, symbol: str, year: int, quarter: int) -> str:
+        """Get the filepath for a transcript"""
+        transcript_dir = os.path.join(self.sec_filings_path, symbol, "transcripts")
+        os.makedirs(transcript_dir, exist_ok=True)
+        return os.path.join(transcript_dir, f"{symbol}_Q{quarter}_{year}_transcript.json")
+
+    def _save_transcript(self, symbol: str, year: int, quarter: int, transcript_data: Dict[str, Any]) -> None:
+        """Save transcript data to a local file"""
+        try:
+            filepath = self._get_transcript_filepath(symbol, year, quarter)
+            
+            # Add metadata to help with future lookups
+            save_data = {
+                "symbol": symbol,
+                "year": year,
+                "quarter": quarter,
+                "saved_at": datetime.now().isoformat(),
+                "data": transcript_data
+            }
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(save_data, f, indent=2, ensure_ascii=False)
+                
+            logger.info(f"Saved transcript to {filepath}")
+                    
+        except Exception as e:
+            logger.error(f"Error saving transcript for {symbol} Q{quarter} {year}: {e}")
+
+    def _load_transcript(self, symbol: str, year: int, quarter: int) -> Optional[Dict[str, Any]]:
+        """Load transcript data from a local file if it exists"""
+        try:
+            filepath = self._get_transcript_filepath(symbol, year, quarter)
+            
+            if os.path.exists(filepath):
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    saved_data = json.load(f)
+                    
+                # Verify the data matches what we're looking for
+                if (saved_data.get("symbol") == symbol and 
+                    saved_data.get("year") == year and 
+                    saved_data.get("quarter") == quarter):
+                    
+                    logger.info(f"Loaded transcript from {filepath}")
+                    return saved_data["data"]
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error loading transcript for {symbol} Q{quarter} {year}: {e}")
+            return None
+
+    def _get_api_ninjas_transcript(self, symbol: str) -> Dict[str, Any]:
+        """Get earnings call transcript from API Ninjas"""
+        try:
+            if not self.config.api_ninjas_key:
+                return {"success": False, "error": "API Ninjas API key not configured"}
+
+            # Get current year and quarter
+            current_date = datetime.now()
+            current_year = current_date.year
+            current_quarter = (current_date.month - 1) // 3 + 1
+
+            # Try current quarter first, then previous quarter if not available
+            for year, quarter in [(current_year, current_quarter), 
+                                (current_year, current_quarter - 1 if current_quarter > 1 else 4),
+                                (current_year - 1 if current_quarter == 1 else current_year, 4 if current_quarter == 1 else current_quarter - 1)]:
+                
+                try:
+                    # First check if we have this transcript locally
+                    local_transcript = self._load_transcript(symbol, year, quarter)
+                    if local_transcript:
+                        return {
+                            "success": True,
+                            "data": local_transcript,
+                            "source": "local_file"
+                        }
+                    
+                    # If not found locally, try API
+                    api_url = f"https://api.api-ninjas.com/v1/earningstranscript"
+                    params = {
+                        "ticker": symbol,
+                        "year": year,
+                        "quarter": quarter
+                    }
+                    headers = {
+                        "X-Api-Key": self.config.api_ninjas_key,
+                        "Accept": "application/json"
+                    }
+                    
+                    response = requests.get(api_url, params=params, headers=headers, timeout=30)
+                    
+                    if response.status_code == 200:
+                        transcript_data = response.json()
+                        
+                        # Check if we got valid transcript data
+                        if transcript_data.get("transcript"):
+                            # Prepare the data structure
+                            transcript_result = {
+                                "transcript": transcript_data["transcript"],
+                                "date": transcript_data["date"],
+                                "year": year,
+                                "quarter": quarter
+                            }
+                            
+                            # Save the transcript locally for future use
+                            self._save_transcript(symbol, year, quarter, transcript_result)
+                            
+                            return {
+                                "success": True,
+                                "data": transcript_result,
+                                "source": "api_ninjas"
+                            }
+                    elif response.status_code == 404:
+                        logger.info(f"No transcript found for {symbol} Q{quarter} {year}")
+                        continue
+                    else:
+                        logger.warning(f"API Ninjas API returned status {response.status_code} for {symbol}")
+                        continue
+            
+                except Exception as e:
+                    logger.warning(f"Error fetching transcript for {symbol} Q{quarter} {year}: {e}")
+                    continue
+            
+            return {"success": False, "error": "No recent transcripts found"}
+            
+        except Exception as e:
+            logger.error(f"Error in API Ninjas transcript retrieval: {e}")
+            return {"success": False, "error": str(e)}
+    
     def get_earnings_call_data(self, symbol: str, quarters: int = 4) -> Dict[str, Any]:
-        """Get earnings conference call transcripts and data"""
+        """Get earnings conference call transcripts and data from Financial Modeling Prep API with API Ninjas fallback"""
         try:
             earnings_data = {
                 "symbol": symbol,
-                "earnings_calls": [],
-                "earnings_calendar": [],
-                "earnings_surprises": []
+                "fiscal_year": None,
+                "date": None,
+                "quarter": None,
+                "transcript": None,
+                "source": "financial_modeling_prep"
             }
             
-            # Get earnings calendar from Finnhub
-            if self.finnhub_client:
+            # Try FMP API first
+            if self.fmp_api_key:
                 try:
-                    from_date = datetime.now().strftime("%Y-%m-%d")
-                    to_date = (datetime.now() + timedelta(days=90)).strftime("%Y-%m-%d")
+                    # Get current year and quarter for local file check
+                    current_date = datetime.now()
+                    current_year = current_date.year
+                    current_quarter = (current_date.month - 1) // 3 + 1
                     
-                    calendar = self.finnhub_client.earnings_calendar(
-                        _from=from_date, to=to_date, symbol=symbol
-                    )
-                    earnings_data["earnings_calendar"] = calendar.get("earningsCalendar", [])
+                    # First check if we have the latest transcript locally
+                    local_transcript = self._load_transcript(symbol, current_year, current_quarter)
+                    if local_transcript:
+                        earnings_data.update({
+                            "transcript": local_transcript["transcript"],
+                            "date": local_transcript["date"],
+                            "quarter": local_transcript["quarter"],
+                            "fiscal_year": local_transcript["year"],
+                            "source": "local_file",
+                            "word_count": len(local_transcript["transcript"].split()),
+                            "scraped_at": datetime.now().isoformat()
+                        })
+                        return {"success": True, "data": earnings_data}
                     
+                    # If not found locally, try FMP API
+                    calendar_url = f"https://financialmodelingprep.com/stable/earning-call-transcript-dates?symbol={symbol}&apikey={self.fmp_api_key}"
+                    response = requests.get(calendar_url)
+                    
+                    if response.status_code == 200:
+                        calendar_data = response.json()
+                        earnings_data.update({
+                            "fiscal_year": calendar_data.get('fiscalYear'),
+                            "date": calendar_data.get('date'),
+                            "quarter": calendar_data.get('quarter')
+                        })
+                    else:
+                        logger.warning(f"Earnings calendar API returned status {response.status_code}")
+                        
+                    # Get earnings call transcripts from FMP
+                    if earnings_data["fiscal_year"] and earnings_data["quarter"]:
+                        # Check if we have this specific transcript locally
+                        local_transcript = self._load_transcript(
+                            symbol, 
+                            earnings_data["fiscal_year"], 
+                            earnings_data["quarter"]
+                        )
+                        if local_transcript:
+                            earnings_data.update({
+                                "transcript": local_transcript["transcript"],
+                                "source": "local_file",
+                                "word_count": len(local_transcript["transcript"].split()),
+                                "scraped_at": datetime.now().isoformat()
+                            })
+                            return {"success": True, "data": earnings_data}
+                        
+                        # If not found locally, try FMP API
+                        transcript_list_url = f"https://financialmodelingprep.com/stable/earning-call-transcript?symbol={symbol}&year={earnings_data['fiscal_year']}&quarter={earnings_data['quarter']}&apikey={self.fmp_api_key}"
+                        response = requests.get(transcript_list_url)
+                        
+                        if response.status_code == 200:
+                            transcript = response.json()
+                            transcript_content = transcript.get('content')
+                            if transcript_content:
+                                earnings_data["transcript"] = transcript_content
+                                # Save FMP transcript locally
+                                self._save_transcript(
+                                    symbol,
+                                    earnings_data["fiscal_year"],
+                                    earnings_data["quarter"],
+                                    {
+                                        "transcript": transcript_content,
+                                        "date": earnings_data["date"],
+                                        "year": earnings_data["fiscal_year"],
+                                        "quarter": earnings_data["quarter"]
+                                    }
+                                )
+                        else:
+                            logger.warning(f"Transcript list API returned status {response.status_code} for {symbol}")
+                            
                 except Exception as e:
-                    logger.warning(f"Could not get earnings calendar: {e}")
-                
-                try:
-                    surprises = self.finnhub_client.earnings_surprise(symbol)
-                    earnings_data["earnings_surprises"] = surprises
-                except Exception as e:
-                    logger.warning(f"Could not get earnings surprises: {e}")
+                    logger.warning(f"Error fetching earnings call transcripts from FMP for {symbol}: {e}")
             
-            # If Finnhub doesn't have transcripts, use alternative approach
-            earnings_data["earnings_calls"] = self._get_alternative_earnings_data(symbol)
+            # If FMP didn't provide transcript content, try API Ninjas as fallback
+            if not earnings_data.get("transcript") or len(str(earnings_data.get("transcript", ""))) < 100:
+                logger.info(f"FMP transcript empty or unavailable, trying API Ninjas for {symbol}...")
+                
+                # Add a small delay to avoid potential rate limiting issues
+                time.sleep(1)
+                
+                # Use API Ninjas to get the transcript
+                api_ninjas_result = self._get_api_ninjas_transcript(symbol)
+                
+                if api_ninjas_result["success"] and api_ninjas_result["data"]["transcript"]:
+                    ninjas_transcript = api_ninjas_result["data"]
+                    
+                    # Update earnings_data with API Ninjas content
+                    earnings_data.update({
+                        "transcript": ninjas_transcript["transcript"],
+                        "date": ninjas_transcript["date"],
+                        "quarter": ninjas_transcript["quarter"],
+                        "fiscal_year": ninjas_transcript["year"],
+                        "source": api_ninjas_result.get("source", "api_ninjas"),
+                        "word_count": len(ninjas_transcript["transcript"].split()),
+                        "scraped_at": datetime.now().isoformat()
+                    })
+                    
+                    logger.info(f"Successfully retrieved transcript from {earnings_data['source']}: {len(ninjas_transcript['transcript'])} characters")
+                else:
+                    logger.warning(f"API Ninjas fallback also failed for {symbol}: {api_ninjas_result.get('error', 'Unknown error')}")
             
             return {"success": True, "data": earnings_data}
             
         except Exception as e:
             logger.error(f"Error getting earnings call data for {symbol}: {e}")
             return {"success": False, "error": str(e)}
-    
-    def _get_alternative_earnings_data(self, symbol: str) -> List[Dict[str, Any]]:
-        """Get earnings data from alternative sources when primary source fails"""
-        try:
-            ticker = yf.Ticker(symbol)
-            earnings_data = []
-            
-            if hasattr(ticker, 'quarterly_earnings') and ticker.quarterly_earnings is not None:
-                quarterly = ticker.quarterly_earnings
-                
-                for index, row in quarterly.iterrows():
-                    earnings_entry = {
-                        "date": str(index),
-                        "quarter": f"Q{((index.month - 1) // 3) + 1}",
-                        "year": index.year,
-                        "revenue": row.get("Revenue", 0),
-                        "earnings": row.get("Earnings", 0),
-                        "source": "yfinance",
-                        "transcript": "Transcript not available from this source"
-                    }
-                    earnings_data.append(earnings_entry)
-            
-            return earnings_data[:4]
-            
-        except Exception as e:
-            logger.warning(f"Alternative earnings data collection failed: {e}")
-            return []
     
     def get_competitor_sec_filings(self, symbol: str, competitors: List[str] = None, filing_types: List[str] = None) -> Dict[str, Any]:
         """Download SEC filings for competitors to enable comparative analysis"""
@@ -895,27 +1214,309 @@ class DataCollectorTools:
             logger.warning(f"Error in sentiment analysis: {e}")
             return self._simple_sentiment_analysis(text)
     
-    # def _simple_sentiment_analysis(self, text: str) -> Dict[str, Any]:
-    #     """Fallback simple sentiment analysis"""
-    #     positive_words = ["growth", "increase", "profit", "beat", "strong", "bullish", "buy", "gains", "up", "rise"]
-    #     negative_words = ["decline", "decrease", "loss", "miss", "weak", "bearish", "sell", "fall", "down", "drop"]
+    def _simple_sentiment_analysis(self, text: str) -> Dict[str, Any]:
+        """Fallback simple sentiment analysis"""
+        positive_words = ["growth", "increase", "profit", "beat", "strong", "bullish", "buy", "gains", "up", "rise"]
+        negative_words = ["decline", "decrease", "loss", "miss", "weak", "bearish", "sell", "fall", "down", "drop"]
         
-    #     text_lower = text.lower()
-    #     positive_count = sum(1 for word in positive_words if word in text_lower)
-    #     negative_count = sum(1 for word in negative_words if word in text_lower)
+        text_lower = text.lower()
+        positive_count = sum(1 for word in positive_words if word in text_lower)
+        negative_count = sum(1 for word in negative_words if word in text_lower)
         
-    #     total_words = positive_count + negative_count
-    #     if total_words == 0:
-    #         return {"label": "neutral", "score": 0.5, "confidence": 0.3, "model": "rule_based"}
+        total_words = positive_count + negative_count
+        if total_words == 0:
+            return {"label": "neutral", "score": 0.5, "confidence": 0.3, "model": "rule_based"}
         
-    #     if positive_count > negative_count:
-    #         confidence = positive_count / total_words
-    #         return {"label": "positive", "score": confidence, "confidence": confidence, "model": "rule_based"}
-    #     elif negative_count > positive_count:
-    #         confidence = negative_count / total_words
-    #         return {"label": "negative", "score": confidence, "confidence": confidence, "model": "rule_based"}
-    #     else:
-    #         return {"label": "neutral", "score": 0.5, "confidence": 0.5, "model": "rule_based"}
+        if positive_count > negative_count:
+            confidence = positive_count / total_words
+            return {"label": "positive", "score": confidence, "confidence": confidence, "model": "rule_based"}
+        elif negative_count > positive_count:
+            confidence = negative_count / total_words
+            return {"label": "negative", "score": confidence, "confidence": confidence, "model": "rule_based"}
+        else:
+            return {"label": "neutral", "score": 0.5, "confidence": 0.5, "model": "rule_based"}
+    
+    def _extract_transcript_content(self, soup: BeautifulSoup) -> str:
+        """Extract transcript content from BeautifulSoup object with multiple fallback methods"""
+        content = ""
+        
+        # Method 1: Try to find the main transcript content using Seeking Alpha's modern layout
+        transcript_selectors = [
+            'div[data-test-id="content-container"]',  # Modern SA layout
+            'div[data-test-id="article-content"]',    # Article content
+            'div.paywall-content',                    # Paywall content area
+            'div.article__content',                   # Article content area
+            'div.sa-art',                             # Alternative SA layout
+            'div[id*="article-content"]',             # Article content with ID
+            'div.content-container',                  # Content container
+            'article div.content',                    # Article content
+            'div.a-body'                              # Article body
+        ]
+        
+        # Try each selector until we find content
+        for selector in transcript_selectors:
+            try:
+                element = soup.select_one(selector)
+                if element:
+                    # Remove unnecessary elements
+                    for unwanted in element.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'button', 'form']):
+                        unwanted.decompose()
+                    
+                    # Get text with proper spacing
+                    text = element.get_text(separator='\n', strip=True)
+                    
+                    # Only use this content if it's substantial and contains transcript indicators
+                    if len(text) > 100 and any(indicator in text.lower() for indicator in [
+                        'company participants',
+                        'conference call participants',
+                        'corporate participants',
+                        'earnings call',
+                        'operator',
+                        'question-and-answer',
+                        'prepared remarks',
+                        'earnings summary',  # Added for modern SA layout
+                        'q1 20',            # Added for earnings period indicators
+                        'q2 20',
+                        'q3 20',
+                        'q4 20'
+                    ]):
+                        content = text
+                        break
+            except Exception as e:
+                logger.debug(f"Error with selector {selector}: {e}")
+                continue
+        
+        # Method 2: If no content found, try to find specific transcript sections
+        if not content:
+            transcript_sections = []
+            
+            # Look for earnings summary section
+            summary_section = soup.find('div', string=lambda text: text and 'Earnings Summary' in text)
+            if summary_section:
+                transcript_sections.append(summary_section.get_text(separator='\n', strip=True))
+            
+            # Look for participants sections
+            participants = soup.find_all('div', string=lambda text: text and any(x in str(text) for x in ['Company Participants', 'Conference Call Participants']))
+            for section in participants:
+                transcript_sections.append(section.get_text(separator='\n', strip=True))
+            
+            # Look for Q&A and prepared remarks
+            qa_sections = soup.find_all('div', string=lambda text: text and any(x in str(text) for x in ['Question-and-Answer', 'Prepared Remarks']))
+            for section in qa_sections:
+                transcript_sections.append(section.get_text(separator='\n', strip=True))
+            
+            if transcript_sections:
+                content = '\n\n'.join(transcript_sections)
+        
+        # Method 3: If still no content, look for any large text blocks with transcript indicators
+        if not content:
+            text_blocks = []
+            for element in soup.find_all(['div', 'section', 'article']):
+                text = element.get_text(strip=True)
+                if len(text) > 500 and any(indicator in text.lower() for indicator in [
+                    'company participants',
+                    'conference call participants',
+                    'corporate participants',
+                    'earnings call',
+                    'operator',
+                    'question-and-answer',
+                    'prepared remarks',
+                    'earnings summary',
+                    'q1 20',
+                    'q2 20',
+                    'q3 20',
+                    'q4 20'
+                ]):
+                    text_blocks.append(text)
+            
+            if text_blocks:
+                # Use the longest block that contains transcript indicators
+                content = max(text_blocks, key=len)
+        
+        # Clean up the content
+        if content:
+            # Remove duplicate newlines and spaces
+            content = re.sub(r'\n\s*\n', '\n\n', content)
+            content = re.sub(r' +', ' ', content)
+            # Remove any remaining HTML entities
+            content = html.unescape(content)
+            # Remove any remaining HTML tags
+            content = re.sub(r'<[^>]+>', '', content)
+            # Standardize quotes and dashes
+            content = content.replace('"', '"').replace('"', '"').replace('–', '-').replace('—', '-')
+            # Remove any non-breaking spaces
+            content = content.replace('\xa0', ' ')
+            # Ensure consistent newlines
+            content = content.replace('\r\n', '\n').replace('\r', '\n')
+            # Remove any leading/trailing whitespace
+            content = content.strip()
+            
+            # Add warning if content seems truncated
+            if len(content) < 3000 and "company participants" in content.lower():
+                content = f"[PAYWALL WARNING] This transcript appears to be behind a paywall. Limited content available:\n\n{content}"
+        
+        return content
+
+    def _get_seeking_alpha_transcripts(self, symbol: str, max_transcripts: int = 3) -> Dict[str, Any]:
+        """Get earnings call transcripts from Seeking Alpha"""
+        try:
+            # First try the direct symbol transcripts page
+            transcripts_list_url = f"https://seekingalpha.com/symbol/{symbol}/earnings/transcripts"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Cache-Control': 'no-cache'
+            }
+            
+            transcripts = []
+            seen_urls = set()  # Track URLs to avoid duplicates
+            
+            # Get the transcript list page
+            try:
+                response = requests.get(transcripts_list_url, headers=headers, timeout=30)
+                response.raise_for_status()
+                
+                soup = BeautifulSoup(response.content, 'html.parser')
+                transcript_links = []
+                
+                # Look for transcript links using multiple methods
+                for link in soup.find_all('a', href=True):
+                    href = link.get('href', '')
+                    text = link.get_text().lower()
+                    
+                    # Method 1: Look for modern article URLs with the correct pattern
+                    # Example: /article/4780879-apple-inc-aapl-q2-2025-earnings-call-transcript
+                    if ('article' in href and 
+                        'earnings-call-transcript' in href and 
+                        symbol.lower() in href.lower() and
+                        any(f"q{i}" in href.lower() for i in range(1, 5))):
+                        
+                        if href.startswith('/'):
+                            href = f"https://seekingalpha.com{href}"
+                        if href not in seen_urls:
+                            transcript_links.append(href)
+                            seen_urls.add(href)
+                    
+                    # Method 2: Look for links containing earnings indicators
+                    elif all(term in text.lower() for term in [symbol.lower(), 'earnings', 'transcript']):
+                        if href.startswith('/'):
+                            href = f"https://seekingalpha.com{href}"
+                        if href not in seen_urls:
+                            transcript_links.append(href)
+                            seen_urls.add(href)
+                    
+                    # Method 3: Look for article IDs with transcript indicators
+                    elif re.search(r'/article/\d+-.*?-earnings-call-transcript', href):
+                        if href.startswith('/'):
+                            href = f"https://seekingalpha.com{href}"
+                        if href not in seen_urls:
+                            transcript_links.append(href)
+                            seen_urls.add(href)
+                
+                # Process each transcript
+                for url in transcript_links[:max_transcripts]:
+                    try:
+                        # Add a small delay between requests
+                        time.sleep(2)
+                        
+                        response = requests.get(url, headers=headers, timeout=30)
+                        response.raise_for_status()
+                        
+                        soup = BeautifulSoup(response.content, 'html.parser')
+                        
+                        # Extract content
+                        content = self._extract_transcript_content(soup)
+                        if not content:
+                            logger.warning(f"No content found for {url}")
+                            continue
+                        
+                        # Get metadata
+                        title = soup.find('h1')
+                        title = title.get_text() if title else "Earnings Call Transcript"
+                        
+                        # Extract date and quarter info from title and URL
+                        date_match = re.search(r'(\w+\s+\d{1,2},\s+\d{4})', title)
+                        date = date_match.group(1) if date_match else None
+                        
+                        # Try to get quarter/year from URL first
+                        url_quarter_match = re.search(r'q(\d)-(\d{4})', url.lower())
+                        if not url_quarter_match:
+                            url_quarter_match = re.search(r'-q(\d)-', url.lower())
+                        
+                        if url_quarter_match:
+                            quarter = int(url_quarter_match.group(1))
+                            year = int(url_quarter_match.group(2)) if len(url_quarter_match.groups()) > 1 else None
+                        else:
+                            # Fallback to title
+                            quarter_match = re.search(r'Q(\d)\s+(\d{4})', title)
+                            quarter = int(quarter_match.group(1)) if quarter_match else None
+                            year = int(quarter_match.group(2)) if quarter_match else None
+                        
+                        # Extract earnings summary if available
+                        summary_section = soup.find('div', string=lambda text: text and 'Earnings Summary' in text)
+                        earnings_summary = None
+                        if summary_section:
+                            summary_text = summary_section.get_text(strip=True)
+                            eps_match = re.search(r'EPS of \$([\d.]+)', summary_text)
+                            revenue_match = re.search(r'Revenue of \$([\d.]+)B', summary_text)
+                            earnings_summary = {
+                                "eps": float(eps_match.group(1)) if eps_match else None,
+                                "revenue_billions": float(revenue_match.group(1)) if revenue_match else None,
+                                "full_text": summary_text
+                            }
+                        
+                        # Check for paywall
+                        is_paywalled = len(content) < 3000
+                        if is_paywalled:
+                            logger.warning(f"Paywall detected for {url} - content length: {len(content)}")
+                        
+                        # Analyze sentiment
+                        sentiment_result = self._analyze_sentiment(content)
+                        
+                        transcript = {
+                            "url": url,
+                            "title": title,
+                            "date": date,
+                            "quarter": quarter,
+                            "year": year,
+                            "content": content,
+                            "content_length": len(content),
+                            "word_count": len(content.split()),
+                            "sentiment": sentiment_result["label"],
+                            "sentiment_score": sentiment_result["score"],
+                            "sentiment_confidence": sentiment_result.get("confidence"),
+                            "is_paywalled": is_paywalled,
+                            "earnings_summary": earnings_summary,
+                            "scraped_at": datetime.now().isoformat()
+                        }
+                        
+                        transcripts.append(transcript)
+                        
+                    except Exception as e:
+                        logger.warning(f"Error processing transcript {url}: {e}")
+                        continue
+                
+                return {
+                    "success": True,
+                    "data": {
+                        "symbol": symbol,
+                        "transcripts_found": len(transcripts),
+                        "transcripts": transcripts
+                    }
+                }
+                
+            except Exception as e:
+                logger.error(f"Error fetching transcript list for {symbol}: {e}")
+                return {"success": False, "error": f"Failed to fetch transcript list: {e}"}
+            
+        except Exception as e:
+            logger.error(f"Error getting Seeking Alpha transcripts for {symbol}: {e}")
+            return {"success": False, "error": str(e)}
 
 class DataCollectorAgent:
     """Multi-source financial data collection agent"""
@@ -1012,10 +1613,10 @@ Reply TERMINATE when all requested data has been collected and stored."""
                     agent_name="DataCollector",
                     content_type="esg_data",
                     content=result["data"],
-                    metadata={"symbol": symbol, "source": "placeholder"},
+                    metadata={"symbol": symbol, "source": "financial_modeling_prep"},
                     tags=["esg", "sustainability", symbol.lower()]
                 )
-                return f"ESG data collected and stored (ID: {entry_id}). Note: {result.get('note', '')}"
+                return f"ESG data collected and stored (ID: {entry_id}) using FMP API"
             else:
                 return f"Failed to collect ESG data: {result['error']}"
         
@@ -1050,20 +1651,21 @@ Reply TERMINATE when all requested data has been collected and stored."""
             else:
                 return f"Failed to collect SEC filings: {result['error']}"
         
-        def collect_earnings_data(symbol: str, quarters: int = 4) -> str:
-            result = self.tools.get_earnings_call_data(symbol, quarters)
+        def collect_earnings_data(symbol: str) -> str:
+            result = self.tools.get_earnings_call_data(symbol)
             
             if result["success"]:
                 entry_id = self.memory_manager.store_entry(
                     agent_name="DataCollector",
                     content_type="earnings_data",
                     content=result["data"],
-                    metadata={"symbol": symbol, "quarters": quarters, "source": "finnhub_yfinance"},
+                    metadata={"symbol": symbol, "source": "FMP"},
                     tags=["earnings", "calls", "transcripts", symbol.lower()]
                 )
-                calls_count = len(result["data"]["earnings_calls"])
-                calendar_count = len(result["data"]["earnings_calendar"])
-                return f"Earnings data collected and stored (ID: {entry_id}). Found {calls_count} earnings calls and {calendar_count} calendar events"
+                transcript_content = result["data"].get("transcript", "")
+                fiscal_year = result["data"].get("fiscal_year", "N/A")
+                quarter = result["data"].get("quarter", "N/A")
+                return f"Earnings data collected and stored (ID: {entry_id}) using FMP API. Found transcript for Q{quarter} {fiscal_year}, content length: {len(transcript_content) if transcript_content else 0} chars"
             else:
                 return f"Failed to collect earnings data: {result['error']}"
         
