@@ -289,3 +289,28 @@ class SharedMemoryManager:
             self.collection.delete()
             
             logger.warning("All memory cleared")
+
+    def get_entries(self, tags: List[str] = None, content_type: str = None, agent_name: str = None) -> List[dict]:
+        """Retrieve entries by tags, content type, and/or agent name"""
+        entries = []
+        
+        with self.lock:
+            for entry in self.json_store["entries"]:
+                # Check if entry matches all specified filters
+                matches = True
+                
+                if tags:
+                    # Entry must have all specified tags
+                    if not all(tag.lower() in [t.lower() for t in entry["tags"]] for tag in tags):
+                        matches = False
+                
+                if content_type and entry["content_type"] != content_type:
+                    matches = False
+                
+                if agent_name and entry["agent_name"] != agent_name:
+                    matches = False
+                
+                if matches:
+                    entries.append(entry)
+        
+        return entries

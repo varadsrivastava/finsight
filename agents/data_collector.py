@@ -67,7 +67,7 @@ class DataCollectorTools:
                 model=model_name,
                 tokenizer=model_name,
                 device=device,
-                return_all_scores=True
+                top_k=None
             )
             logger.info(f"Initialized sentiment model: {model_name}")
             
@@ -75,12 +75,26 @@ class DataCollectorTools:
             logger.warning(f"Could not initialize FinBERT, falling back to simple model: {e}")
             self.sentiment_model = None
     
-    def get_stock_data(self, symbol: str, period: str = "2y") -> Dict[str, Any]:
+    def get_stock_data(self, symbol: str, period: str = "1y") -> Dict[str, Any]:
         """Get stock price and volume data from Yahoo Finance"""
         try:
             ticker = yf.Ticker(symbol)
             hist_data = ticker.history(period=period)
             info = ticker.info
+            
+            # Get S&P 500 data for the same period
+            spy = yf.Ticker("^GSPC")
+            spy_hist = spy.history(period=period)
+            
+            # Calculate percentage changes from the start
+            if not hist_data.empty and not spy_hist.empty:
+                # Stock percentage change
+                initial_price = hist_data['Close'].iloc[0]
+                hist_data['pct_change'] = ((hist_data['Close'] - initial_price) / initial_price) * 100
+                
+                # S&P 500 percentage change
+                initial_spy = spy_hist['Close'].iloc[0]
+                spy_hist['pct_change'] = ((spy_hist['Close'] - initial_spy) / initial_spy) * 100
             
             price_data = {
                 "symbol": symbol,
@@ -96,7 +110,9 @@ class DataCollectorTools:
                     "prices": hist_data["Close"].tolist(),
                     "volumes": hist_data["Volume"].tolist(),
                     "highs": hist_data["High"].tolist(),
-                    "lows": hist_data["Low"].tolist()
+                    "lows": hist_data["Low"].tolist(),
+                    "pct_changes": hist_data["pct_change"].tolist(),
+                    "spy_pct_changes": spy_hist["pct_change"].tolist()
                 }
             }
             
@@ -116,29 +132,50 @@ class DataCollectorTools:
                 "income_statement": {},
                 "balance_sheet": {},
                 "cash_flow": {},
+                "stock_price_history": {},
                 "key_metrics": {}
             }
             
             # Income Statement
             if hasattr(ticker, 'financials') and ticker.financials is not None:
-                inc_stmt = ticker.financials.fillna(0)
+                inc_stmt = ticker.financials.infer_objects(copy=False).fillna(0)
                 financials["income_statement"] = {
                     str(col): inc_stmt[col].to_dict() for col in inc_stmt.columns
                 }
             
             # Balance Sheet
             if hasattr(ticker, 'balance_sheet') and ticker.balance_sheet is not None:
-                balance = ticker.balance_sheet.fillna(0)
+                balance = ticker.balance_sheet.infer_objects(copy=False).fillna(0)
                 financials["balance_sheet"] = {
                     str(col): balance[col].to_dict() for col in balance.columns
                 }
             
             # Cash Flow
             if hasattr(ticker, 'cashflow') and ticker.cashflow is not None:
-                cf = ticker.cashflow.fillna(0)
+                cf = ticker.cashflow.infer_objects(copy=False).fillna(0)
                 financials["cash_flow"] = {
                     str(col): cf[col].to_dict() for col in cf.columns
                 }
+
+            # Stock Price History for P/E
+            
+            if hasattr(ticker, 'history'): #and ticker.history is not None:
+                prices = ticker.history(period="max")['Close']
+                income_stmt = ticker.income_stmt
+                max_prices = {}
+                for date_str, data in income_stmt.items():
+                    date = pd.to_datetime(date_str).tz_localize(prices.index.tz)  # Localize the date to the same timezone as price
+                    start_date = date - timedelta(days=365)
+                    period_prices = prices[(prices.index >= start_date) & (prices.index <= date)]
+                    if not period_prices.empty:
+                        max_prices[date_str] = period_prices.max()
+                    else:
+                        max_prices[date_str] = None
+
+                # print(f"Max prices: {max_prices}")
+                max_prices = {str(k): v for k, v in max_prices.items()}
+                financials["max_prices"] = max_prices 
+
             
             # Key metrics
             info = ticker.info
@@ -164,32 +201,49 @@ class DataCollectorTools:
         try:
             news_data = {"symbol": symbol, "articles": []}
             
+            # Try Finnhub first
             if self.finnhub_client:
-                from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-                to_date = datetime.now().strftime("%Y-%m-%d")
-                
-                news = self.finnhub_client.company_news(symbol, _from=from_date, to=to_date)
-                
-                for article in news[:20]:
-                    headline = article.get("headline", "")
-                    summary = article.get("summary", "")
-                    combined_text = f"{headline} {summary}"
+                try:
+                    from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+                    to_date = datetime.now().strftime("%Y-%m-%d")
                     
-                    sentiment_result = self._analyze_sentiment(combined_text)
+                    news = self.finnhub_client.company_news(symbol, _from=from_date, to=to_date)
                     
-                    news_data["articles"].append({
-                        "headline": headline,
-                        "summary": summary,
-                        "url": article.get("url", ""),
-                        "source": article.get("source", ""),
-                        "datetime": article.get("datetime", 0),
-                        "sentiment": sentiment_result["label"],
-                        "sentiment_score": sentiment_result["score"],
-                        "sentiment_confidence": sentiment_result["confidence"],
-                        "sentiment_model": sentiment_result.get("model", "unknown")
-                    })
+                    if news and len(news) > 0:
+                        for article in news[:20]:
+                            headline = article.get("headline", "")
+                            summary = article.get("summary", "")
+                            combined_text = f"{headline} {summary}"
+                            
+                            sentiment_result = self._analyze_sentiment(combined_text)
+                            
+                            news_data["articles"].append({
+                                "headline": headline,
+                                "summary": summary,
+                                "url": article.get("url", ""),
+                                "source": article.get("source", ""),
+                                "datetime": article.get("datetime", 0),
+                                "sentiment": sentiment_result["label"],
+                                "sentiment_score": sentiment_result["score"],
+                                "sentiment_confidence": sentiment_result["confidence"],
+                                "sentiment_model": sentiment_result.get("model", "unknown")
+                            })
+                        
+                        return {"success": True, "data": news_data}
+                    else:
+                        logger.warning(f"No news found from Finnhub for {symbol}, trying Marketaux fallback")
+                except Exception as e:
+                    logger.warning(f"Error getting news from Finnhub for {symbol}: {e}, trying Marketaux fallback")
+            else:
+                logger.info(f"Finnhub client not configured for {symbol}, trying Marketaux fallback")
             
-            return {"success": True, "data": news_data}
+            # Try Marketaux as fallback
+            marketaux_result = self._get_marketaux_news(symbol, days_back)
+            if marketaux_result["success"]:
+                return marketaux_result
+            else:
+                logger.error(f"Both Finnhub and Marketaux failed for {symbol}")
+                return {"success": False, "error": "Failed to get news from both Finnhub and Marketaux"}
             
         except Exception as e:
             logger.error(f"Error getting news for {symbol}: {e}")
@@ -1518,6 +1572,84 @@ class DataCollectorTools:
             logger.error(f"Error getting Seeking Alpha transcripts for {symbol}: {e}")
             return {"success": False, "error": str(e)}
 
+    def _get_marketaux_news(self, symbol: str, days_back: int = 30) -> Dict[str, Any]:
+        """Get news from Marketaux API"""
+        try:
+            if not self.config.marketaux_api_key:
+                return {"success": False, "error": "Marketaux API key not configured"}
+
+            # Calculate date range
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days_back)
+
+            # Prepare API request
+            base_url = "https://api.marketaux.com/v1/news/all"
+            params = {
+                "api_token": self.config.marketaux_api_key,
+                "symbols": symbol,
+                "filter_entities": "true",
+                "language": "en",
+                "countries": "us",
+                "limit": 50,  # Maximum allowed by the API
+                "published_after": start_date.strftime("%Y-%m-%dT%H:%M"),
+                "published_before": end_date.strftime("%Y-%m-%dT%H:%M")
+            }
+
+            response = requests.get(base_url, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                news_data = {
+                    "symbol": symbol,
+                    "articles": []
+                }
+
+                for article in data.get("data", []):
+                    # Extract entities related to our symbol
+                    relevant_entities = [
+                        entity for entity in article.get("entities", [])
+                        if entity.get("symbol") == symbol
+                    ]
+
+                    # Get the entity sentiment if available
+                    entity_sentiment = None
+                    if relevant_entities:
+                        entity = relevant_entities[0]
+                        entity_sentiment = {
+                            "label": "positive" if entity.get("sentiment_score", 0) > 0 else 
+                                    "negative" if entity.get("sentiment_score", 0) < 0 else "neutral",
+                            "score": entity.get("sentiment_score", 0),
+                            "confidence": abs(entity.get("sentiment_score", 0)),
+                            "model": "marketaux"
+                        }
+
+                    # If no entity sentiment, analyze the title/description
+                    if not entity_sentiment:
+                        combined_text = f"{article.get('title', '')} {article.get('description', '')}"
+                        entity_sentiment = self._analyze_sentiment(combined_text)
+
+                    news_data["articles"].append({
+                        "headline": article.get("title"),
+                        "summary": article.get("description"),
+                        "url": article.get("url"),
+                        "source": article.get("source"),
+                        "datetime": article.get("published_at"),
+                        "sentiment": entity_sentiment["label"],
+                        "sentiment_score": entity_sentiment["score"],
+                        "sentiment_confidence": entity_sentiment["confidence"],
+                        "sentiment_model": entity_sentiment["model"],
+                        "entities": relevant_entities
+                    })
+
+                return {"success": True, "data": news_data}
+            else:
+                return {"success": False, "error": f"Marketaux API returned status {response.status_code}"}
+
+        except Exception as e:
+            logger.error(f"Error getting news from Marketaux for {symbol}: {e}")
+            return {"success": False, "error": str(e)}
+
 class DataCollectorAgent:
     """Multi-source financial data collection agent"""
     
@@ -1544,10 +1676,10 @@ Your responsibilities:
 1. Collect stock price and trading data from Yahoo Finance
 2. Retrieve company financial statements and key metrics
 3. Gather recent news and market sentiment using HuggingFace models
-4. Download and parse actual SEC filings (10-K, 10-Q, 8-K)
-5. Collect earnings call data and transcripts
+4. Download actual SEC filings (10-K, 10-Q, 8-K)
+5. Collect earnings call transcripts
 6. Download competitor SEC filings for comparative analysis
-7. Obtain ESG data and market trends
+7. Obtain ESG data
 
 For each data request:
 - Use appropriate tools to gather multi-source data
@@ -1563,7 +1695,7 @@ Reply TERMINATE when all requested data has been collected and stored."""
     def _register_tools(self):
         """Register data collection tools with the agent"""
         
-        def collect_stock_data(symbol: str, period: str = "2y") -> str:
+        def collect_stock_data(symbol: str, period: str = "1y") -> str:
             result = self.tools.get_stock_data(symbol, period)
             if result["success"]:
                 entry_id = self.memory_manager.store_entry(
@@ -1616,7 +1748,7 @@ Reply TERMINATE when all requested data has been collected and stored."""
                     metadata={"symbol": symbol, "source": "financial_modeling_prep"},
                     tags=["esg", "sustainability", symbol.lower()]
                 )
-                return f"ESG data collected and stored (ID: {entry_id}) using FMP API"
+                return f"ESG data collected and stored (ID: {entry_id})"
             else:
                 return f"Failed to collect ESG data: {result['error']}"
         
@@ -1662,6 +1794,7 @@ Reply TERMINATE when all requested data has been collected and stored."""
                     metadata={"symbol": symbol, "source": "FMP"},
                     tags=["earnings", "calls", "transcripts", symbol.lower()]
                 )
+                transcript_content = result["data"].get("transcript", "")
                 transcript_content = result["data"].get("transcript", "")
                 fiscal_year = result["data"].get("fiscal_year", "N/A")
                 quarter = result["data"].get("quarter", "N/A")
@@ -1717,32 +1850,100 @@ Reply TERMINATE when all requested data has been collected and stored."""
             for data_type in request.data_types:
                 try:
                     if data_type == "financial":
-                        self.tools.get_stock_data(request.symbol)
-                        self.tools.get_company_financials(request.symbol)
+                        # Collect and store stock data
+                        stock_result = self.tools.get_stock_data(request.symbol)
+                        if stock_result["success"]:
+                            self.memory_manager.store_entry(
+                                agent_name="DataCollector",
+                                content_type="stock_data",
+                                content=stock_result["data"],
+                                metadata={"symbol": request.symbol, "period": "1y", "source": "yahoo_finance"},
+                                tags=["stock_data", "price", request.symbol.lower()]
+                            )
+                        
+                        # Collect and store financial statements
+                        financials_result = self.tools.get_company_financials(request.symbol)
+                        if financials_result["success"]:
+                            self.memory_manager.store_entry(
+                                agent_name="DataCollector",
+                                content_type="financial_statements",
+                                content=financials_result["data"],
+                                metadata={"symbol": request.symbol, "source": "yahoo_finance"},
+                                tags=["financial_statements", "financials", request.symbol.lower()]
+                            )
+                        
                         results["data_types_completed"].append("financial")
                     
                     elif data_type == "news":
-                        self.tools.get_company_news(request.symbol, request.lookback_days)
+                        news_result = self.tools.get_company_news(request.symbol, request.lookback_days)
+                        if news_result["success"]:
+                            self.memory_manager.store_entry(
+                                agent_name="DataCollector",
+                                content_type="news",
+                                content=news_result["data"],
+                                metadata={"symbol": request.symbol, "days_back": request.lookback_days, "source": "finnhub"},
+                                tags=["news", "sentiment", request.symbol.lower()]
+                            )
                         results["data_types_completed"].append("news")
                     
                     elif data_type == "esg":
-                        self.tools.get_esg_data(request.symbol)
+                        esg_result = self.tools.get_esg_data(request.symbol)
+                        if esg_result["success"]:
+                            self.memory_manager.store_entry(
+                                agent_name="DataCollector",
+                                content_type="esg_data",
+                                content=esg_result["data"],
+                                metadata={"symbol": request.symbol, "source": "financial_modeling_prep"},
+                                tags=["esg_data", "esg", request.symbol.lower()]
+                            )
                         results["data_types_completed"].append("esg")
                     
                     elif data_type == "trends":
-                        self.tools.get_market_trends(request.symbol)
+                        trends_result = self.tools.get_market_trends(request.symbol)
+                        if trends_result["success"]:
+                            self.memory_manager.store_entry(
+                                agent_name="DataCollector",
+                                content_type="market_trends",
+                                content=trends_result["data"],
+                                metadata={"symbol": request.symbol, "source": "yahoo_finance"},
+                                tags=["market_trends", "trends", request.symbol.lower()]
+                            )
                         results["data_types_completed"].append("trends")
                     
                     elif data_type == "sec":
-                        self.tools.get_sec_filings(request.symbol, request.filing_types)
+                        sec_result = self.tools.get_sec_filings(request.symbol, request.filing_types)
+                        if sec_result["success"]:
+                            self.memory_manager.store_entry(
+                                agent_name="DataCollector",
+                                content_type="sec_filings",
+                                content=sec_result["data"],
+                                metadata={"symbol": request.symbol, "filing_types": request.filing_types, "source": "sec_edgar"},
+                                tags=["sec_filings", "sec", request.symbol.lower()]
+                            )
                         results["data_types_completed"].append("sec")
                     
                     elif data_type == "earnings":
-                        self.tools.get_earnings_call_data(request.symbol)
+                        earnings_result = self.tools.get_earnings_call_data(request.symbol)
+                        if earnings_result["success"]:
+                            self.memory_manager.store_entry(
+                                agent_name="DataCollector",
+                                content_type="earnings_data",
+                                content=earnings_result["data"],
+                                metadata={"symbol": request.symbol, "source": "FMP"},
+                                tags=["earnings_data", "earnings", request.symbol.lower()]
+                            )
                         results["data_types_completed"].append("earnings")
                     
                     elif data_type == "competitors":
-                        self.tools.get_competitor_sec_filings(request.symbol, request.competitors, request.filing_types)
+                        competitors_result = self.tools.get_competitor_sec_filings(request.symbol, request.competitors, request.filing_types)
+                        if competitors_result["success"]:
+                            self.memory_manager.store_entry(
+                                agent_name="DataCollector",
+                                content_type="competitor_filings",
+                                content=competitors_result["data"],
+                                metadata={"symbol": request.symbol, "competitors": request.competitors, "source": "sec_edgar"},
+                                tags=["competitor_filings", "competitors", request.symbol.lower()]
+                            )
                         results["data_types_completed"].append("competitors")
                         
                 except Exception as e:

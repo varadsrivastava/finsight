@@ -137,7 +137,7 @@ Begin by understanding the research request, then systematically coordinate agen
             logger.info(f"Stage 1: Data Collection for {symbol}")
             data_request = DataRequest(
                 symbol=symbol,
-                data_types=["financial", "news", "esg", "trends", "sec"],
+                data_types=["financial", "news", "esg", "trends", "sec","earnings","competitors"],
                 lookback_days=30,
                 include_fundamentals=True
             )
@@ -245,8 +245,10 @@ Begin by understanding the research request, then systematically coordinate agen
             # Generate summary report
             logger.info("Generating batch summary report")
             report_agent = self.agents['report_writer'].agent
+            symbol_list = ', '.join([f"'{s}'" for s in symbols])
             summary_result = report_agent.generate_reply(
-                f"create_summary_report([{', '.join([f\"'{s}'\" for s in symbols])}])"
+                f"create_summary_report([{symbol_list}])"
+                )
             
             batch_results["summary_report"] = summary_result
             

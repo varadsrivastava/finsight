@@ -12,10 +12,13 @@ from autogen import AssistantAgent
 import requests
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+import openai
+from tqdm import tqdm
 
 from shared_memory.memory_manager import SharedMemoryManager
 from config.config import AGENT_CONFIGS, FinSightConfig
+from agents.pdf_analyzer import PDFAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -29,37 +32,45 @@ class FinancialChartGenerator:
         # Set style for professional-looking charts
         plt.style.use('seaborn-v0_8')
         sns.set_palette("husl")
+        
+        # Flag to control image display
+        self.show_plots = True
+    
+    def display_image(self, fig):
+        """Display the matplotlib figure if show_plots is True"""
+        if self.show_plots:
+            plt.show()
     
     def create_price_chart(self, price_data: Dict[str, Any], symbol: str) -> str:
         """Create a price and volume chart"""
         try:
             hist_data = price_data.get("historical_data", {})
             dates = pd.to_datetime(hist_data.get("dates", []))
-            prices = hist_data.get("prices", [])
-            volumes = hist_data.get("volumes", [])
+            pct_changes = hist_data.get("pct_changes", [])
+            spy_pct_changes = hist_data.get("spy_pct_changes", [])
             
-            if not dates.empty and prices:
-                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), height_ratios=[3, 1])
+            if not dates.empty and pct_changes and spy_pct_changes:
+                fig, ax = plt.subplots(figsize=(12, 6))
                 
-                # Price chart
-                ax1.plot(dates, prices, linewidth=2, color='#2E86AB', label='Close Price')
-                ax1.set_title(f'{symbol} Stock Price', fontsize=16, fontweight='bold')
-                ax1.set_ylabel('Price ($)', fontsize=12)
-                ax1.grid(True, alpha=0.3)
-                ax1.legend()
+                # Plot percentage changes
+                ax.plot(dates, pct_changes, linewidth=2, color='#2E86AB', label=f'{symbol} Change %')
+                ax.plot(dates, spy_pct_changes, linewidth=2, color='#F18F01', label='S&P 500 Change %')
                 
-                # Volume chart
-                ax2.bar(dates, volumes, color='#A23B72', alpha=0.7, width=1)
-                ax2.set_title('Trading Volume', fontsize=14)
-                ax2.set_ylabel('Volume', fontsize=12)
-                ax2.set_xlabel('Date', fontsize=12)
-                ax2.grid(True, alpha=0.3)
+                ax.set_title(f'{symbol} vs S&P 500 - Change % Over the Past Year', fontsize=16, fontweight='bold')
+                ax.set_ylabel('Change %', fontsize=12)
+                ax.set_xlabel('Date', fontsize=12)
+                ax.grid(True, alpha=0.3)
+                ax.legend()
                 
                 plt.tight_layout()
-                
+
                 # Save chart
-                chart_path = os.path.join(self.output_path, f"{symbol}_price_chart.png")
+                chart_path = os.path.join(self.output_path, f"{symbol}_vs_spy_chart.png")
                 plt.savefig(chart_path, dpi=300, bbox_inches='tight')
+                
+                # Display the chart
+                self.display_image(fig)
+                
                 plt.close()
                 
                 return chart_path
@@ -105,12 +116,15 @@ class FinancialChartGenerator:
                 for bar, value in zip(bars, values):
                     height = bar.get_height()
                     ax.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{value:.1f}%' if abs(value) < 10 else f'{value:.1f}',
+                           f'{value:.1f}%' if value < 100 else f'{value:.0f}%',
                            ha='center', va='bottom', fontsize=10)
                 
                 plt.xticks(rotation=45)
                 plt.grid(True, alpha=0.3)
                 plt.tight_layout()
+                
+                # Display the chart
+                self.display_image(fig)
                 
                 chart_path = os.path.join(self.output_path, f"{symbol}_ratios_chart.png")
                 plt.savefig(chart_path, dpi=300, bbox_inches='tight')
@@ -149,6 +163,9 @@ class FinancialChartGenerator:
             
             plt.tight_layout()
             
+            # Display the chart
+            self.display_image(fig)
+            
             chart_path = os.path.join(self.output_path, f"{symbol}_sentiment_chart.png")
             plt.savefig(chart_path, dpi=300, bbox_inches='tight')
             plt.close()
@@ -158,97 +175,240 @@ class FinancialChartGenerator:
         except Exception as e:
             logger.error(f"Error creating sentiment chart: {e}")
             return None
+    
+    def create_pe_eps_chart(self, financial_data: Dict[str, Any], symbol: str) -> str:
+        """Create a chart showing P/E ratio and EPS over time"""
+        try:
+            # Extract income statement data
+            income_stmt = financial_data.get("income_statement", {})
+            max_prices = financial_data.get("max_prices", {})
+            info = financial_data.get("key_metrics", {})
+            
+            if not income_stmt:
+                logger.error("No income statement data available")
+                return None
+            
+            if not max_prices:
+                logger.error("No historical stock price data available")
+                return None
+                
+            # Convert dates and sort chronologically
+            dates = []
+            eps_values = []
+            pe_values = []
+            
+            # Get EPS from income statement
+            for date_str, data in income_stmt.items():
+                try:
+                    date = pd.to_datetime(date_str)
+                    # Calculate EPS from net income and shares outstanding if available
+                    net_income = data.get("Net Income", 0)
+                    shares = data.get("Diluted Average Shares", None)
+                    if net_income and shares:
+                        eps = net_income / shares
+                        eps_values.append(eps)
+                        dates.append(date)
+                        
+                    # Calculate P/E using historical stock prices if available
+                    if max_prices[str(date_str)] and eps != 0:
+                        pe = max_prices[str(date_str)] / eps
+                        pe_values.append(pe)
+                    else:
+                        pe_values.append(None)
 
-class FinTralImageAnalyzer:
-    """Placeholder for FinTral multimodal analysis"""
+                except Exception as e:
+                    logger.warning(f"Error processing date {date_str}: {e}")
+                    continue
+            
+            if not dates or not eps_values:
+                logger.error("No valid EPS data found")
+                return None
+            
+            # Create the plot
+            fig, ax1 = plt.subplots(figsize=(12, 6))
+            
+            # Plot EPS
+            color1 = '#2E86AB'
+            ax1.set_xlabel('Date')
+            ax1.set_ylabel('EPS ($)', color=color1)
+            line1 = ax1.plot(dates, eps_values, color=color1, linewidth=2, label='EPS')
+            ax1.tick_params(axis='y', labelcolor=color1)
+            
+            # Plot P/E ratio on secondary axis if available
+            if any(pe_values):
+                ax2 = ax1.twinx()
+                color2 = '#F18F01'
+                ax2.set_ylabel('P/E Ratio', color=color2)
+                line2 = ax2.plot(dates, pe_values, color=color2, linewidth=2, linestyle='--', label='P/E Ratio')
+                ax2.tick_params(axis='y', labelcolor=color2)
+                
+                # Add both lines to legend
+                lines = line1 + line2
+                labels = [l.get_label() for l in lines]
+                ax1.legend(lines, labels, loc='upper left')
+            else:
+                ax1.legend(loc='upper left')
+            
+            ax1.grid(True, alpha=0.3)
+            plt.title(f'{symbol} - EPS and P/E Ratio Over Time', fontsize=16, fontweight='bold')
+            plt.tight_layout()
+            
+            # Save chart
+            chart_path = os.path.join(self.output_path, f"{symbol}_pe_eps_chart.png")
+            plt.savefig(chart_path, dpi=300, bbox_inches='tight')
+            
+            # Display the chart
+            self.display_image(fig)
+            
+            plt.close()
+            
+            return chart_path
+            
+        except Exception as e:
+            logger.error(f"Error creating P/E and EPS chart: {e}")
+            return None
+        
+
+class AnnualReportAnalyzer:
+    """Agent for analyzing annual report PDF"""
     
-    def __init__(self, config: FinSightConfig):
+    def __init__(self, config: FinSightConfig, memory_manager: SharedMemoryManager):
         self.config = config
-        # In a real implementation, this would connect to FinTral API
-        self.fintral_available = False
-    
-    def analyze_financial_image(self, image_path: str) -> Dict[str, Any]:
-        """Analyze financial charts, tables, or documents using FinTral"""
+        self.memory_manager = memory_manager
+        self.pdf_analyzer = PDFAnalyzer(self.config, memory_manager)
+        
+    def analyze_annual_report_pdf(self, symbol: str, year: Optional[str] = None) -> str:
+        """Analyze annual report PDF using ColPali retrieval and vision models"""
         try:
-            # Placeholder implementation - in production, integrate with actual FinTral
+
+            # check if retrieved images json exists
+            retrieved_images_path = os.path.join(self.config.sec_filings_path, symbol, "10-K", "retrieved_images.json")
             
-            # For now, use GPT-4V as a substitute
-            if self.config.openai_api_key:
-                return self._analyze_with_gpt4v(image_path)
-            else:
-                return {
-                    "success": False,
-                    "error": "No multimodal analysis available. Please configure FinTral or GPT-4V."
-                }
+            if not os.path.exists(retrieved_images_path):
+                print(f"Retrieved images not found for {symbol}. Analyzing annual report...")
+                retrieved_images = self.analyze_annual_report(symbol, year)
+                return retrieved_images
+            
+            # load retrieved images
+            with open(retrieved_images_path, "r") as f:
+                retrieved_images = json.load(f)
+
+            analysis_result = self.report_analysis_gpt(retrieved_images)
+
+            return {"success": True, "data": analysis_result}
+
+                                    
+        except Exception as e:
+            return f"Error analyzing annual report for {symbol}: {e}"
+            
+        
+    def analyze_annual_report(self, symbol: str, year: Optional[str] = None) -> str:
+        """Analyze annual report PDF"""
+        try:
+
+            # Load model
+            self.pdf_analyzer.load_model()
+            
+            # Find PDF
+            selected_pdf = self.pdf_analyzer.find_annual_report(symbol, year)
+            if not selected_pdf:
+                return f"Annual report PDF not found for {symbol}"
+            
+            # Extract pages as images
+            images, page_texts = self.pdf_analyzer.extract_pages_as_images(selected_pdf)
+            
+            # Create index if not exists
+            pdf_images, page_embeddings = self.pdf_analyzer.create_retrieval_index(symbol, images)
+            # return f"Failed to create retrieval index for {symbol}"
+
+            # Create query embeddings
+            queries, query_embeddings = self.pdf_analyzer.create_query_embeddings(self.pdf_analyzer.analysis_aspects)
+            
+            # Retrieve pages for aspect
+            retrieved_images_for_gpt = self.pdf_analyzer.retrieve_pages_for_aspect(selected_pdf, queries, pdf_images, symbol, query_embeddings, page_embeddings, k=5)
+            
+            return retrieved_images_for_gpt            
+            
                 
         except Exception as e:
-            logger.error(f"Error analyzing image: {e}")
-            return {"success": False, "error": str(e)}
+            return f"Error analyzing annual report for {symbol}: {e}"
+            
     
-    def _analyze_with_gpt4v(self, image_path: str) -> Dict[str, Any]:
-        """Use GPT-4V as substitute for FinTral analysis"""
+    def report_analysis_gpt(self, retrieved_images):
+        """Analyze annual report PDF using GPT-4o mini"""
         try:
-            # Encode image to base64
-            with open(image_path, "rb") as image_file:
-                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-            
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.config.openai_api_key}"
-            }
-            
-            payload = {
-                "model": "gpt-4-vision-preview",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": """Analyze this financial image/chart/table. Provide:
-                                1. Type of visualization (chart, table, document, etc.)
-                                2. Key data points and trends
-                                3. Financial insights and implications
-                                4. Data quality assessment
-                                5. Investment-relevant conclusions
-                                
-                                Structure your response as JSON with these sections."""
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 1000
-            }
-            
-            response = requests.post("https://api.openai.com/v1/chat/completions", 
-                                   headers=headers, json=payload)
-            
-            if response.status_code == 200:
-                result = response.json()
-                analysis_text = result["choices"][0]["message"]["content"]
-                
-                return {
-                    "success": True,
-                    "analysis_type": "gpt4v_substitute",
-                    "analysis": analysis_text,
-                    "image_path": image_path,
-                    "model": "gpt-4-vision-preview"
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": f"API call failed: {response.status_code}"
-                }
-                
+            # Initialize the OpenAI client
+            client = openai.OpenAI()
+
+            # List to store the results
+            gpt_analysis_results = []
+
+            # Get aspects and instructions from pdf_analyzer
+            queries = self.pdf_analyzer.analysis_aspects
+            # instructions = [self.pdf_analyzer.analysis_aspects[query]["instruction"] for query in queries]
+
+            # Iterate through the retrieved images and make API calls
+
+
+            # Define the instructions for each query
+            for item in tqdm(retrieved_images):
+                try:
+                    query_instruction = self.pdf_analyzer.analysis_aspects_instructions[item["query"]]
+
+                    page_number = item["page_number"]
+                    base64_image = item["base64_image"]
+
+                    # Construct the messages list
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": "You are a Financial MultiModal Analyzer that analyzes images from the company's annual report based on the query. If the image does not contain any relevant information, only mention that no relevant information is present."
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": query_instruction},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    },
+                                },
+                            ],
+                        },
+                    ]
+
+                    # Make the API call
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=messages,
+                        max_tokens=300,
+                    )
+
+                    # Store the response with the corresponding query and page number
+                    gpt_analysis_results.append({
+                        "query": item["query"],
+                        "page_number": page_number,
+                        "image": base64_image,
+                        "gpt_response": response.choices[0].message.content
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Error processing image for query '{item['query']}', page {item['page_number']}: {e}")
+                    gpt_analysis_results.append({
+                        "query": item["query"],
+                        "page_number": page_number,
+                        "image": base64_image,
+                        "error": str(e)
+                    })
+
+            return gpt_analysis_results
+                        
         except Exception as e:
-            logger.error(f"Error in GPT-4V analysis: {e}")
-            return {"success": False, "error": str(e)}
+            logger.error(f"Error analyzing annual report PDF using GPT-4o mini: {e}")
+            return []
+
+
 
 class MultimodalAnalyzerAgent:
     """Agent for analyzing financial images, charts, and multimodal content"""
@@ -257,7 +417,9 @@ class MultimodalAnalyzerAgent:
         self.config = FinSightConfig()
         self.memory_manager = memory_manager
         self.chart_generator = FinancialChartGenerator(self.config.charts_output_path)
-        self.image_analyzer = FinTralImageAnalyzer(self.config)
+        self.pdf_analyzer = PDFAnalyzer(self.config, memory_manager)
+        self.client = openai.OpenAI(api_key=self.config.openai_api_key)
+        self.annual_report_analyzer = AnnualReportAnalyzer(self.config, memory_manager)
         
         # Create the Autogen agent
         self.agent = AssistantAgent(
@@ -271,23 +433,30 @@ class MultimodalAnalyzerAgent:
         self._register_tools()
     
     def _get_system_message(self) -> str:
-        return """You are a MultimodalAnalyzer agent specialized in financial image and chart analysis.
+        return """You are a MultimodalAnalyzer agent specialized in financial text, image and chart analysis.
 
 Your responsibilities:
 1. Generate professional financial charts and visualizations
-2. Analyze financial images, charts, and tables using FinTral capabilities
-3. Extract insights from visual financial data
-4. Assess data quality and reliability in visual materials
-5. Provide investment-relevant conclusions from multimodal content
+2. Analyze financial images, charts, and tables using vision models
+3. Analyze annual report PDFs using ColPali retrieval and vision models
+4. Extract insights from visual financial data and PDF documents
+5. Assess data quality and reliability in visual materials
+6. Provide investment-relevant conclusions from multimodal content
 
 For each analysis:
 - Create clear, professional visualizations when generating charts
-- Use FinTral (or GPT-4V substitute) for image understanding
-- Extract quantitative data from visual sources
+- Use vision models for image understanding and PDF analysis
+- Extract quantitative data from visual sources and PDF documents
 - Provide actionable financial insights
 - Store results in shared memory with proper metadata
 
-Focus on accuracy and clear communication of visual financial information.
+PDF Analysis capabilities:
+- Find and analyze annual report PDFs for companies
+- Extract and analyze specific financial aspects: income statement, balance sheet, cash flow, business segments, risk factors, business summary, company description
+- Use ColPali for intelligent page retrieval
+- Analyze retrieved pages with vision models using specialized financial prompts
+
+Always prioritize data accuracy and completeness. If data is missing or uncertain, clearly indicate this in your response.
 
 Reply TERMINATE when all requested analysis is complete."""
     
@@ -384,6 +553,51 @@ Reply TERMINATE when all requested analysis is complete."""
             except Exception as e:
                 return f"Error generating ratios chart: {e}"
         
+        def generate_pe_eps_chart(symbol: str) -> str:
+            """Generate P/E ratio and EPS chart from stored data"""
+            try:
+                # Search for financial data in memory
+                entries = self.memory_manager.search_entries(
+                    query=f"financial statements {symbol}",
+                    content_type_filter="financial_statements",
+                    n_results=1
+                )
+                
+                if not entries:
+                    return f"No financial data found for {symbol}. Please collect data first."
+                
+                # Get the full entry
+                entry = self.memory_manager.get_entry_by_id(entries[0]["id"])
+                if not entry:
+                    return "Could not retrieve financial data entry."
+                
+                # Generate chart
+                chart_path = self.chart_generator.create_pe_eps_chart(
+                    entry["content"], symbol
+                )
+                
+                if chart_path:
+                    # Store chart information in memory
+                    self.memory_manager.store_entry(
+                        agent_name="MultimodalAnalyzer",
+                        content_type="chart",
+                        content={
+                            "chart_type": "pe_eps",
+                            "symbol": symbol,
+                            "file_path": chart_path,
+                            "description": f"P/E ratio and EPS chart for {symbol}"
+                        },
+                        metadata={"symbol": symbol, "chart_type": "pe_eps"},
+                        tags=["chart", "pe_ratio", "eps", symbol.lower()]
+                    )
+                    
+                    return f"P/E and EPS chart generated and saved: {chart_path}"
+                else:
+                    return "Failed to generate P/E and EPS chart"
+                    
+            except Exception as e:
+                return f"Error generating P/E and EPS chart: {e}"
+        
         def generate_sentiment_chart(symbol: str) -> str:
             """Generate news sentiment chart from stored data"""
             try:
@@ -428,41 +642,7 @@ Reply TERMINATE when all requested analysis is complete."""
                     
             except Exception as e:
                 return f"Error generating sentiment chart: {e}"
-        
-        def analyze_financial_image(image_path: str, analysis_context: str = "general") -> str:
-            """Analyze financial image using FinTral capabilities"""
-            try:
-                if not os.path.exists(image_path):
-                    return f"Image file not found: {image_path}"
-                
-                # Analyze image
-                result = self.image_analyzer.analyze_financial_image(image_path)
-                
-                if result["success"]:
-                    # Store analysis in memory
-                    entry_id = self.memory_manager.store_entry(
-                        agent_name="MultimodalAnalyzer",
-                        content_type="image_analysis",
-                        content={
-                            "image_path": image_path,
-                            "analysis_context": analysis_context,
-                            "analysis_result": result,
-                            "timestamp": datetime.now().isoformat()
-                        },
-                        metadata={
-                            "image_path": image_path,
-                            "analysis_type": result.get("analysis_type", "unknown"),
-                            "model": result.get("model", "unknown")
-                        },
-                        tags=["image_analysis", "multimodal", analysis_context]
-                    )
-                    
-                    return f"Image analysis completed and stored (ID: {entry_id}). Analysis: {result['analysis'][:200]}..."
-                else:
-                    return f"Image analysis failed: {result['error']}"
-                    
-            except Exception as e:
-                return f"Error analyzing image: {e}"
+    
         
         def create_comprehensive_visualization(symbol: str) -> str:
             """Create a comprehensive set of visualizations for a symbol"""
@@ -475,6 +655,9 @@ Reply TERMINATE when all requested analysis is complete."""
                 
                 ratios_result = generate_ratios_chart(symbol)
                 results.append(f"Ratios Chart: {ratios_result}")
+                
+                pe_eps_result = generate_pe_eps_chart(symbol)
+                results.append(f"P/E and EPS Chart: {pe_eps_result}")
                 
                 sentiment_result = generate_sentiment_chart(symbol)
                 results.append(f"Sentiment Chart: {sentiment_result}")
@@ -496,10 +679,77 @@ Reply TERMINATE when all requested analysis is complete."""
                 
             except Exception as e:
                 return f"Error creating comprehensive visualization: {e}"
+            
         
+        def collect_annual_report_analysis(symbol: str, year: Optional[str] = None) -> str:
+            """Analyze annual report PDF using ColPali retrieval and vision models"""
+            try:
+                # First check if we already have PDF analysis for this symbol in memory
+                existing_entries = self.memory_manager.search_entries(
+                    query=f"pdf analysis {symbol} annual report",
+                    content_type_filter=None,  
+                    n_results=7
+                )
+                
+                # Filter for PDF analysis entries specifically
+                pdf_analysis_entries = []
+                for entry in existing_entries:
+                    entry_data = self.memory_manager.get_entry_by_id(entry["id"])
+                    if (entry_data and 
+                        entry_data.get("agent_name", "").startswith("MultimodalAnalyzer") and
+                        entry_data.get("content_type", "").startswith("pdf_analysis_") and
+                        entry_data.get("metadata", {}).get("symbol") == symbol):
+                        pdf_analysis_entries.append(entry_data)
+                
+                if pdf_analysis_entries:
+                    # Return summary of existing analysis
+                    aspects_found = [entry["metadata"].get("aspect", "unknown") for entry in pdf_analysis_entries]
+                    entry_ids = [entry["id"] for entry in pdf_analysis_entries]
+                    return f"PDF analysis already exists for {symbol}. Found analysis for aspects: {aspects_found}. Entry IDs: {entry_ids}. Use existing data or delete entries to reanalyze."
+                
+                # If no existing analysis found, proceed with new analysis
+                result = self.annual_report_analyzer.analyze_annual_report_pdf(symbol, year)
+
+                # Store in memory
+                # combine results for each query
+                if result["success"]:
+                    combined_results = {}
+                    analysis_result = result["data"]
+                    for item in analysis_result:
+                        if item["query"] not in combined_results:
+                            combined_results[item["query"]] = f"Analysis for Page number: {item["page_number"]} \n {item["gpt_response"]}"
+                        else:
+                            combined_results[item["query"]] += f"\n\nAnalysis for Page number: {item["page_number"]} \n {item["gpt_response"]}"
+                    
+                    entry_ids = []
+                    for aspect in combined_results.keys():
+                        entry_id = self.memory_manager.store_entry(
+                            agent_name="MultimodalAnalyzer",
+                            content_type=f"pdf_analysis_{aspect.strip().replace(' ', '_').lower()}",
+                            content=combined_results[aspect],
+                            metadata={
+                                "symbol": symbol,
+                                "aspect": aspect,
+                                # "pdf_path": os.path.dirname(retrieved_images_path),
+                                # "pages_analyzed": item["page_number"]
+                            },
+                            tags=["pdf_analysis", aspect.lower(), symbol.lower(), "annual_report"]
+                        )
+                        entry_ids.append(entry_id)
+                    
+                    return f"Successfully analyzed Report for {symbol}. Analysis stored with IDs: {entry_ids}."
+                else:
+                    return f"Failed to analyze annual report for {symbol}: {result.get('error', 'Unknown error')}"
+                    
+            except Exception as e:
+                return f"Error analyzing annual report PDF: {e}"
+
+        
+
         # Register functions with autogen
         self.agent.register_for_execution(name="generate_price_chart")(generate_price_chart)
         self.agent.register_for_execution(name="generate_ratios_chart")(generate_ratios_chart)
+        self.agent.register_for_execution(name="generate_pe_eps_chart")(generate_pe_eps_chart)
         self.agent.register_for_execution(name="generate_sentiment_chart")(generate_sentiment_chart)
-        self.agent.register_for_execution(name="analyze_financial_image")(analyze_financial_image)
         self.agent.register_for_execution(name="create_comprehensive_visualization")(create_comprehensive_visualization)
+        self.agent.register_for_execution(name="collect_annual_report_analysis")(collect_annual_report_analysis)

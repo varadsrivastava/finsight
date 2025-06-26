@@ -1,0 +1,45 @@
+{
+  "timestamp": "2025-06-25T01:18:12.926669",
+  "symbol": "MSFT",
+  "total_tests": 7,
+  "passed_tests": 3,
+  "success_rate": 42.857142857142854,
+  "detailed_results": {
+    "chart_generation": {
+      "price_chart": {
+        "status": "PASS",
+        "path": "./outputs/charts\\MSFT_vs_spy_chart.png"
+      },
+      "ratios_chart": {
+        "status": "PASS",
+        "path": "./outputs/charts\\MSFT_ratios_chart.png"
+      },
+      "pe_eps_chart": {
+        "status": "PASS",
+        "path": "./outputs/charts\\MSFT_pe_eps_chart.png"
+      }
+    },
+    "chart_memory_storage": {
+      "price_chart_storage": {
+        "status": "FAIL",
+        "error": "'AssistantAgent' object has no attribute 'generate_price_chart'"
+      },
+      "comprehensive_viz": {
+        "status": "FAIL",
+        "error": "'AssistantAgent' object has no attribute 'create_comprehensive_visualization'"
+      }
+    },
+    "pdf_analysis": {
+      "pdf_existence": {
+        "status": "FAIL",
+        "error": "PDF file not found: 2023-07-27_10-K_msft-20230630.htm.pdf"
+      }
+    },
+    "pdf_memory_storage": {
+      "storage_success": {
+        "status": "FAIL",
+        "error": "'AssistantAgent' object has no attribute 'collect_annual_report_analysis'"
+      }
+    }
+  }
+}

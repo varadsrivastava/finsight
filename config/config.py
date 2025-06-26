@@ -18,6 +18,7 @@ class FinSightConfig(BaseModel):
     newsapi_key: Optional[str] = Field(default=None)
     fmp_api_key: Optional[str] = Field(default=None)
     api_ninjas_key: Optional[str] = Field(default=None)
+    marketaux_api_key: Optional[str] = Field(default=None)
     
     # Model Configurations
     primary_model: str = Field(default="gpt-4-0125-preview")
@@ -65,6 +66,7 @@ class FinSightConfig(BaseModel):
             "newsapi_key": os.getenv("NEWSAPI_KEY"),
             "fmp_api_key": os.getenv("FMP_API_KEY"),
             "api_ninjas_key": os.getenv("API_NINJAS_KEY"),
+            "marketaux_api_key": os.getenv("MARKETAUX_API_KEY"),
             "edgar_company_name": os.getenv("EDGAR_COMPANY_NAME", "FinSight"),
             "edgar_email": os.getenv("EDGAR_EMAIL", "user@finsight.ai"),
             "charts_output_path": os.getenv("CHARTS_OUTPUT_PATH", "outputs/charts"),
